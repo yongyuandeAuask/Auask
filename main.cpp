@@ -1,11 +1,12 @@
 #include "paradise_api.h"
 #include <stdio.h>
+#include <stdlib.h>   // 【修复】加入这个头文件，解决 system() 未声明报错
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
 
-const char* STOP_FILE = "/data/local/tmp/stop_tracker";
+const char* STOP_FILE = "/data/关闭";
 volatile bool g_Running = true;
 void SignalHandler(int sig) { g_Running = false; }
 
