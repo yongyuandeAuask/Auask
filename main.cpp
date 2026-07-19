@@ -82,7 +82,7 @@ int main() {
     system("setenforce 0");
     printf("========================================\n");
     printf(" 智能活跃线程 HWBP 狙击 + 追踪验证\n");
-    printf========================================\n");
+    printf("========================================\n");
 
     paradise_driver drv;
     pid_t pid = drv.get_pid("com.tencent.ig");
@@ -145,7 +145,7 @@ int main() {
         // 持续喂坐标
         drv.hwbp_update_tracking(&track);
         
-        // 顺便检测一下 HWBP 到底有没有触发 (虽然作者说不记录，但试试无妨)
+        // 顺便检测一下 HWBP 到底有没有触发
         for(pid_t tid : active_tids) {
             hit_args.pid = tid;
             hit_args.real_count = 0;
