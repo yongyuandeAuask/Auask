@@ -10,10 +10,14 @@
 #include <vector>
 
 #define PI 3.14159265358979323846f
+#define HEAD_BONE_IDX 6   // 头部在 component-space 骨骼数组的索引；若打偏胸/颈，调这里
 
+// ===== 全局热调参 / 开关 =====
 volatile float g_yaw_offset   = 0.0f;
 volatile bool  g_yaw_invert   = false;
 volatile float g_pitch_offset = 0.0f;
+volatile bool  g_team_filter  = true;   // 队友过滤：默认开（带保护，训练场安全）
+volatile bool  g_skip_bot     = false;  // 跳人机：默认关（训练场目标就是人机！实战按 g 开）
 volatile bool  g_Running      = true;
 
 static void sig_handler(int){
@@ -28,6 +32,8 @@ void* InputThread(void*){
     printf("  \033[1;32m默认自动追踪最近目标，无需按键。\033[0m\n");
     printf("  b=反转Yaw  l=Yaw+15  r=Yaw-15  u=Pitch+5  d=Pitch-5\n");
     printf("  数字(如 90/-90)=强制Yaw偏移\n");
+    printf("  t=队友过滤(当前:%s)  g=跳人机(当前:%s)\n",
+           g_team_filter?"开":"关", g_skip_bot?"开":"关");
     printf("  \033[1;31mq=清除断点并结束 (Ctrl+C 同效)\033[0m\n");
     printf("\033[1;33m==================================\033[0m\n");
     while(g_Running){
@@ -39,6 +45,8 @@ void* InputThread(void*){
         else if(c=='r'||c=='R'){ g_yaw_offset-=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n", g_yaw_offset); }
         else if(c=='u'||c=='U'){ g_pitch_offset+=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n", g_pitch_offset); }
         else if(c=='d'||c=='D'){ g_pitch_offset-=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n", g_pitch_offset); }
+        else if(c=='t'||c=='T'){ g_team_filter=!g_team_filter; printf("\n\033[1;32m[*] 队友过滤: %s\033[0m\n", g_team_filter?"开":"关"); }
+        else if(c=='g'||c=='G'){ g_skip_bot=!g_skip_bot; printf("\n\033[1;32m[*] 跳人机: %s\033[0m\n", g_skip_bot?"开(实战)":"关(训练场)"); }
         else { float v=atof(buf); if(v!=0.0f||buf[0]=='0'){ g_yaw_offset=v; printf("\n\033[1;32m[*] Yaw偏强制: %.0f\033[0m\n", g_yaw_offset); } }
     }
     return NULL;
@@ -73,12 +81,11 @@ static std::vector<pid_t> enum_tids(pid_t pid){
     closedir(d); return v;
 }
 
-// inject=false 时不写寄存器，子弹按原弹道飞（无目标时放行）
 static void fill_inject(HW_BP_INFO& info,float p,float y,bool inject){
     info.is_write_gp_regs=false;
     info.is_write_fp_regs=inject;
     info.fp_reg_count=2;
-    info.fp_reg_indices[0]=3; info.fp_reg_indices[1]=4;
+    info.fp_reg_indices[0]=3; info.fp_reg_indices[1]=4;   // V3=Pitch V4=Yaw
     memset(info.fp_reg_values[0],0,16); memset(info.fp_reg_values[1],0,16);
     memcpy(&info.fp_reg_values[0][0],&p,4);
     memcpy(&info.fp_reg_values[1][0],&y,4);
@@ -127,48 +134,77 @@ int main(){
         float aim_pitch=0, aim_yaw=0;
         bool found=false, cam_ok=false;
         float minDist=0;
+        int bestTeam=0; bool bestBot=false;
 
-        uintptr_t p1=drv.read_fast<uintptr_t>(base+0xf1fb900);
-        uintptr_t p2=drv.read_fast<uintptr_t>(p1+0x810);
-        uintptr_t UWorld=drv.read_fast<uintptr_t>(p2+0x78);
+        // ---- 自身链（与绘制.cpp 更新地址数据 逐字节一致）----
+        uintptr_t pA=drv.read_fast<uintptr_t>(base+0xf1fb900);
+        uintptr_t pB=drv.read_fast<uintptr_t>(pA+0x810);
+        uintptr_t UWorld=drv.read_fast<uintptr_t>(pB+0x78);
         if(UWorld>0x10000){
-            uintptr_t o1=drv.read_fast<uintptr_t>(UWorld+0x38);
-            uintptr_t o2=drv.read_fast<uintptr_t>(o1+0x78);
-            uintptr_t o3=drv.read_fast<uintptr_t>(o2+0x30);
-            uintptr_t Oneself=drv.read_fast<uintptr_t>(o3+0x28c8);
+            uintptr_t pD=drv.read_fast<uintptr_t>(UWorld+0x38);
+            uintptr_t pE=drv.read_fast<uintptr_t>(pD+0x78);
+            uintptr_t pF=drv.read_fast<uintptr_t>(pE+0x30);
+            uintptr_t Oneself=drv.read_fast<uintptr_t>(pF+0x28c8);
             if(Oneself>0x10000){
-                uintptr_t PC=drv.read_fast<uintptr_t>(Oneself+0x4b18);
+                int selfTeam=drv.read_fast<int>(Oneself+0x998);   // 自身队伍（队友过滤用）
+
+                // ---- 玩家控制器 -> 相机（0x4b18 / 0x548，绘制.cpp 验证）----
+                uintptr_t PC =drv.read_fast<uintptr_t>(Oneself+0x4b18);
                 uintptr_t Cam=drv.read_fast<uintptr_t>(PC+0x548);
+
+                // ---- 相机位置：写死 Cam+0x530（=绘制.cpp PovLocation: +0x520+0x10）----
                 FVector CamPos={0,0,0};
-                if(Cam>0x10000) for(int off=0;off<=64;off+=4){
-                    FRotator tr=drv.read_fast<FRotator>(Cam+off);
-                    if(tr.Pitch>=-90&&tr.Pitch<=90&&tr.Yaw!=0){
-                        CamPos=drv.read_fast<FVector>(Cam+off-12);
-                        if(CamPos.X==0&&CamPos.Y==0)CamPos=drv.read_fast<FVector>(Cam+off-16);
-                        break;
-                    }
+                if(Cam>0x10000){
+                    CamPos=drv.read_fast<FVector>(Cam+0x530);
+                    if(CamPos.X!=0||CamPos.Y!=0) cam_ok=true;
                 }
-                if(CamPos.X!=0||CamPos.Y!=0){
-                    cam_ok=true;   // ★ 相机位置读到了
-                    uintptr_t Lv=drv.read_fast<uintptr_t>(UWorld+0x30);
-                    uintptr_t Arr=drv.read_fast<uintptr_t>(Lv+0xA0);
-                    int Cnt=drv.read_fast<int>(Lv+0xA8);
+
+                if(cam_ok){
+                    // ---- 世界数组（非解密分支，与绘制.cpp 一致）----
+                    uintptr_t Uleve=drv.read_fast<uintptr_t>(UWorld+0x30);
+                    uintptr_t Arr  =drv.read_fast<uintptr_t>(Uleve+0xA0);
+                    int Cnt        =drv.read_fast<int>(Uleve+0xA8);
                     minDist=999999; FVector best={0,0,0};
+
                     for(int i=0;i<Cnt&&i<100;i++){
                         uintptr_t O=drv.read_fast<uintptr_t>(Arr+8*i);
                         if(O<0x10000||O==Oneself)continue;
+
+                        // 队友过滤（带保护：自身队伍无效时不跳，防训练场误杀）
+                        if(g_team_filter){
+                            int team=drv.read_fast<int>(O+0x998);
+                            if(selfTeam!=0 && selfTeam!=-1 && team==selfTeam) continue;
+                        }
+                        // 死亡/倒地过滤（绘制.cpp: 状态 1048592/1048576 跳过）
+                        int status=drv.read_fast<int>(O+0x1058);
+                        if(status==1048592 || status==1048576) continue;
+                        // 血量过滤
                         float hp=drv.read_fast<float>(O+0xe60);
-                        if(hp<=0||hp>200)continue;
+                        if(hp<=0.0f || hp>200.0f) continue;
+                        // 人机判断（绘制.cpp: +0xa59 的三个魔数；开关默认关）
+                        int team2=drv.read_fast<int>(O+0x998);
+                        int botFlag=drv.read_fast<int>(O+0xa59);
+                        bool isBot=(team2!=0 && (botFlag==16842753||botFlag==16843009||botFlag==16843008));
+                        if(g_skip_bot && isBot) continue;
+
+                        // 骨骼 -> 头部世界坐标（Mesh 偏移与绘制.cpp 一致）
                         uintptr_t Mesh=drv.read_fast<uintptr_t>(O+0x510);
                         if(Mesh<0x10000)continue;
                         uintptr_t BB=drv.read_fast<uintptr_t>(Mesh+0x9a8)+0x30;
                         if(BB<0x10000)continue;
-                        FTransform mT,hT; getBone(&drv,Mesh+0x210,mT); getBone(&drv,BB+6*48,hT);
-                        float c2w[4][4],bM[4][4],fM[4][4]; T2M(mT,c2w); T2M(hT,bM); MM(bM,c2w,fM);
-                        FVector H={fM[3][0],fM[3][1],fM[3][2]+7.0f};
+                        FTransform mT,hT;
+                        getBone(&drv,Mesh+0x210,mT);
+                        getBone(&drv,BB+HEAD_BONE_IDX*48,hT);
+                        float c2w[4][4],bM[4][4],fM[4][4];
+                        T2M(mT,c2w); T2M(hT,bM); MM(bM,c2w,fM);
+                        FVector H={fM[3][0],fM[3][1],fM[3][2]};   // 不再 +7，与绘制.cpp 一致
+
                         float dx=H.X-CamPos.X,dy=H.Y-CamPos.Y,dz=H.Z-CamPos.Z;
                         float dist=sqrt(dx*dx+dy*dy+dz*dz)*0.01f;
-                        if(dist<minDist&&dist<300){minDist=dist;best=H;found=true;}
+                        if(dist<minDist&&dist<300){
+                            minDist=dist; best=H; found=true;
+                            bestTeam=team2; bestBot=isBot;
+                        }
                     }
                     if(found){
                         float dx=best.X-CamPos.X,dy=best.Y-CamPos.Y,dz=best.Z-CamPos.Z;
@@ -185,15 +221,17 @@ int main(){
         // 有目标才注入，否则放行（子弹正常飞）
         for(auto& inf: infos){ fill_inject(inf, aim_pitch, aim_yaw, found); drv.hwbp_enable(&inf); }
 
-        // ★ 三态状态行：一眼看出追踪卡在哪一环
         if(++tick%5==0){
             if(found)
-                printf("\r\033[1;32m[追踪] %.1fm P%.1f Y%.1f 反%s Y%.0f P%.0f        \033[0m",
-                       minDist, aim_pitch, aim_yaw, g_yaw_invert?"T":"F", g_yaw_offset, g_pitch_offset);
+                printf("\r\033[1;32m[追踪] %.1fm P%.1f Y%.1f %s | 队%d%s 队友%s 人机%s   \033[0m",
+                       minDist, aim_pitch, aim_yaw, g_yaw_invert?"反":"",
+                       bestTeam, bestBot?"(机)":"",
+                       g_team_filter?"开":"关", g_skip_bot?"开":"关");
             else if(cam_ok)
-                printf("\r\033[1;33m[无目标] 相机OK 但300m内没活人/全死        \033[0m");
+                printf("\r\033[1;33m[无目标] 相机OK 但无合法目标(全死/被过滤) 队过滤=%s 跳人机=%s   \033[0m",
+                       g_team_filter?"开":"关", g_skip_bot?"开":"关");
             else
-                printf("\r\033[1;31m[无相机] 读不到相机位置，检查相机偏移        \033[0m");
+                printf("\r\033[1;31m[无相机] Cam+0x530 读不到坐标，确认人在局内   \033[0m");
             fflush(stdout);
         }
         usleep(10000);
