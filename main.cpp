@@ -5,23 +5,20 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <pthread.h>
-#include <signal.h>          // ★ 新增：Ctrl+C 也走清理
+#include <signal.h>
 #include <math.h>
 #include <vector>
-#include <string>
 
 #define PI 3.14159265358979323846f
 #define MAGIC_PITCH 85.0f
 #define MAGIC_YAW   90.0f
 
-// ===== 全局热调参 =====
 volatile float g_yaw_offset   = 0.0f;
 volatile bool  g_yaw_invert   = false;
 volatile float g_pitch_offset = 0.0f;
-volatile int   g_mode         = 0;     // 0=瞄准 1=魔数
-volatile bool  g_Running      = true;  // ★ 退出总开关：q / Ctrl+C 都置 false
+volatile int   g_mode         = 0;
+volatile bool  g_Running      = true;
 
-// ★ Ctrl+C 处理：只置标志 + 用 async-signal-safe 的 write 提示，绝不在 handler 里调驱动
 static void sig_handler(int){
     g_Running = false;
     const char m[] = "\n[!] 收到退出信号，正在清理断点...\n";
@@ -31,32 +28,27 @@ static void sig_handler(int){
 void* InputThread(void*){
     char buf[64];
     printf("\n\033[1;33m========== 弹道控制台 ==========\033[0m\n");
-    printf("  \033[1;35mm\033[0m = 切换 瞄准/魔数 模式\n");
-    printf("  b=反转Yaw  l=Yaw+15  r=Yaw-15  u=Pitch+5  d=Pitch-5\n");
-    printf("  数字(如 90/-90/85)=强制Yaw偏移\n");
-    printf("  \033[1;31mq\033[0m = 清除所有断点并结束进程  (Ctrl+C 同样有效)\n");
+    printf("  m=切换瞄准/魔数  b=反转Yaw  l=Yaw+15  r=Yaw-15\n");
+    printf("  u=Pitch+5  d=Pitch-5  数字=强制Yaw偏移\n");
+    printf("  \033[1;31mq=清除断点并结束 (Ctrl+C 同效)\033[0m\n");
     printf("\033[1;33m==================================\033[0m\n");
     while(g_Running){
         if(!fgets(buf,sizeof(buf),stdin)) continue;
         char c=buf[0];
-        // ★ 每条反馈前加 \n，防止被主循环的 \r 状态行覆盖而"看起来没反应"
-        if(c=='q'||c=='Q'){
-            g_Running=false;
-            printf("\n\033[1;31m[q] 收到退出指令，主循环将清理断点并结束。\033[0m\n");
-            break;
-        }
-        else if(c=='m'||c=='M'){g_mode=!g_mode; printf("\n\033[1;32m[*] 模式: %s\033[0m\n",g_mode?"魔数(朝天验证)":"瞄准");}
-        else if(c=='b'||c=='B'){g_yaw_invert=!g_yaw_invert; printf("\n\033[1;32m[*] Yaw反转: %s\033[0m\n",g_yaw_invert?"开":"关");}
-        else if(c=='l'||c=='L'){g_yaw_offset+=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n",g_yaw_offset);}
-        else if(c=='r'||c=='R'){g_yaw_offset-=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n",g_yaw_offset);}
-        else if(c=='u'||c=='U'){g_pitch_offset+=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n",g_pitch_offset);}
-        else if(c=='d'||c=='D'){g_pitch_offset-=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n",g_pitch_offset);}
-        else { float v=atof(buf); if(v!=0.0f||buf[0]=='0'){g_yaw_offset=v; printf("\n\033[1;32m[*] Yaw偏强制: %.0f\033[0m\n",g_yaw_offset);} }
+        if(c=='q'||c=='Q'){ g_Running=false; printf("\n\033[1;31m[q] 退出中...\033[0m\n"); break; }
+        else if(c=='m'||c=='M'){ g_mode=!g_mode; printf("\n\033[1;32m[*] 模式: %s\033[0m\n", g_mode?"魔数":"瞄准"); }
+        else if(c=='b'||c=='B'){ g_yaw_invert=!g_yaw_invert; printf("\n\033[1;32m[*] Yaw反转: %s\033[0m\n", g_yaw_invert?"开":"关"); }
+        else if(c=='l'||c=='L'){ g_yaw_offset+=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n", g_yaw_offset); }
+        else if(c=='r'||c=='R'){ g_yaw_offset-=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n", g_yaw_offset); }
+        else if(c=='u'||c=='U'){ g_pitch_offset+=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n", g_pitch_offset); }
+        else if(c=='d'||c=='D'){ g_pitch_offset-=5; printf("\n\033[1;32m[*] Pitch偏: %.0f\033[0m\n", g_pitch_offset); }
+        else { float v=atof(buf); if(v!=0.0f||buf[0]=='0'){ g_yaw_offset=v; printf("\n\033[1;32m[*] Yaw偏强制: %.0f\033[0m\n", g_yaw_offset); } }
     }
     return NULL;
 }
 
-struct FVector{float X,Y,Z;}; struct FRotator{float Pitch,Yaw,Roll;};
+struct FVector{float X,Y,Z;};
+struct FRotator{float Pitch,Yaw,Roll;};
 struct FTransform{float rot[4];float trans[3];float scale[3];};
 
 void getBone(paradise_driver* d,uintptr_t a,FTransform& o){
@@ -94,25 +86,18 @@ static void fill_inject(HW_BP_INFO& info,float p,float y,bool inject){
     memcpy(&info.fp_reg_values[1][0],&y,4);
 }
 
-// ★ 统一清理：逐 tid disable + 全局 clear，双保险，确保内核不留断点
 static void cleanup(paradise_driver& drv, std::vector<HW_BP_INFO>& infos){
-    printf("\n\033[1;33m========== 正在清除所有断点 ==========\033[0m\n");
-    int d_ok=0;
-    for(auto& inf : infos){
-        if(drv.hwbp_disable(inf.pid, inf.addr)) d_ok++;   // 先逐个摘除
-    }
-    drv.hwbp_clear();                                      // 再兜底全清
-    printf("\033[1;32m[+] 已 disable %zu 个线程断点，hwbp_clear 已执行。\033[0m\n", infos.size());
-    printf("\033[1;32m[+] 断点已全部清除，进程安全结束。\033[0m\n");
-    printf("\033[1;33m======================================\033[0m\n");
+    printf("\n\033[1;33m========== 清除断点 ==========\033[0m\n");
+    for(auto& inf : infos) drv.hwbp_disable(inf.pid, inf.addr);
+    drv.hwbp_clear();
+    printf("\033[1;32m[+] 断点已清除，安全结束。\033[0m\n");
 }
 
 int main(){
     system("setenforce 0");
-    signal(SIGINT,  sig_handler);   // ★ Ctrl+C -> 置 g_Running=false，走统一清理
+    signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("==== 最终版：正确注入 + 干净退出(q / Ctrl+C) ====\n");
     paradise_driver drv;
     pid_t pid=drv.get_pid("com.tencent.ig");
     if(pid<=0)pid=drv.get_pid("com.rekoo.pubgm");
@@ -123,32 +108,23 @@ int main(){
     uintptr_t base=drv.get_module_base("libUE4.so");
     if(!base){printf("[-] 基址失败\n");return 1;}
     uintptr_t addr=base+0x6DFE100;
-    printf("[+] pid=%d base=0x%lx ShootBulletInner=0x%lx\n",pid,base,addr);
-    uint32_t insn=0; bool rd=drv.read_fast(addr,&insn,4);
-    printf("[地址自检] 入口指令=0x%08x (%s)\n",insn,rd?"OK":"FAIL");
+    printf("[+] pid=%d ShootBulletInner=0x%lx\n",pid,addr);
 
     auto tids=enum_tids(pid);
-    printf("[+] 线程数=%zu\n",tids.size());
-
     std::vector<HW_BP_INFO> infos; int add_ok=0;
     for(pid_t t:tids){
         HW_BP_INFO info={0};
         info.pid=t; info.addr=addr; info.type=HW_BP_TYPE_X; info.len=4;
         if(drv.hwbp_add(&info)){ add_ok++; infos.push_back(info); }
     }
-    printf("[+] hwbp_add 成功=%d/%zu\n",add_ok,tids.size());
+    printf("[+] 断点装到 %d/%zu 线程\n",add_ok,tids.size());
     if(add_ok==0){printf("[-] 全失败\n");return 1;}
 
     pthread_t tid_in;
     pthread_create(&tid_in,NULL,InputThread,NULL);
-    pthread_detach(tid_in);   // ★ 必须 detach：绝不能 join（join 会卡在 fgets 死锁）
+    pthread_detach(tid_in);
 
-    printf("\033[1;33m[!] 默认瞄准。乱飞按 m 切魔数对照。退出按 q 或 Ctrl+C。\033[0m\n");
-    printf("----------------------------------------------------\n");
-
-    HWBP_HIT_ITEM hits[4]; int diag_left=3;
-    int no_target_tick=0;
-
+    int tick=0;
     while(g_Running){
         float aim_pitch=0, aim_yaw=0; bool found=false; float minDist=0;
         uintptr_t p1=drv.read_fast<uintptr_t>(base+0xf1fb900);
@@ -212,8 +188,19 @@ int main(){
 
         for(auto& inf: infos){ fill_inject(inf, fp, fy, inject); drv.hwbp_enable(&inf); }
 
-        if(g_mode==1)
-            printf("\r\033[1;35m[魔数] 注入 P=%.0f Y=%.0f (应朝天偏东)   \033[0m",MAGIC_PITCH,MAGIC_YAW);
-        else if(found)
-            printf("\r\033[1;32m[瞄准] 距%.1fm 注入 P=%.1f Y=%.1f | 偏: 反=%s Y%.0f P%.0f   \033[0m",
-                   minDist,aim_pitch,aim_yaw,g_yaw_invert?"T":"F",g_yaw_offset,g_pitch_o
+        if(++tick%5==0){
+            if(g_mode==1)
+                printf("\r\033[1;35m[魔数] P=%.0f Y=%.0f        \033[0m", MAGIC_PITCH, MAGIC_YAW);
+            else if(found)
+                printf("\r\033[1;32m[瞄准] 距%.1fm P=%.1f Y=%.1f 反=%s Y偏%.0f P偏%.0f   \033[0m",
+                       minDist, aim_pitch, aim_yaw, g_yaw_invert?"T":"F", g_yaw_offset, g_pitch_offset);
+            else
+                printf("\r\033[1;31m[未锁定] 按m对照 按q退出   \033[0m");
+            fflush(stdout);
+        }
+        usleep(10000);
+    }
+
+    cleanup(drv, infos);
+    return 0;
+}
