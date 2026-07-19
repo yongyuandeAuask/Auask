@@ -23,6 +23,7 @@ void* InputThread(void* arg) {
 }
 
 struct FVector { float X, Y, Z; };
+struct FRotator { float Pitch, Yaw, Roll; };
 struct FTransform { float rot[4]; float trans[3]; float scale[3]; };
 
 void getBone(paradise_driver* drv, uintptr_t addr, FTransform& out) {
@@ -53,7 +54,8 @@ void MatrixMulti(const float A[4][4], const float B[4][4], float C[4][4]) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf(" 纯净版绝对角度锁头 (彻底抛弃黑盒API)\n");
+    printf(" 开火瞬间真实角度窃听与标定器\n");
+    printf(" (手动瞄准头部开枪，对比理论与真实数据)\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -67,7 +69,7 @@ int main() {
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
     uintptr_t shoot_addr = base + 0x6DFE100;
 
-    // 1. 全量登记 PTE UXN 断点
+    // 1. 全量登记 PTE UXN 断点 (为了纳秒级窃听)
     std::vector<pid_t> tids;
     char path[256];
     sprintf(path, "/proc/%d/task", pid);
@@ -87,14 +89,10 @@ int main() {
     info.addr = shoot_addr;
     info.type = HW_BP_TYPE_X;
     info.len = 4;
-    
-    for (pid_t tid : tids) {
-        info.pid = tid;
-        drv.hwbp_add(&info);
-    }
-    printf("[+] 已为 %zu 个线程登记 PTE UXN 断点\n", tids.size());
+    for (pid_t tid : tids) { info.pid = tid; drv.hwbp_add(&info); }
+    printf("[+] 已为 %zu 个线程登记窃听断点\n", tids.size());
 
-    // 【核心】彻底关闭黑盒 Tracking API，防止它覆盖我们的角度！
+    // 关闭黑盒 Tracking
     TRACKING_DATA track_off = {0};
     track_off.is_active = false;
     drv.hwbp_update_tracking(&track_off);
@@ -102,17 +100,22 @@ int main() {
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;42;37m[*] 纯净版锁头已激活！\033[0m\n");
-    printf("\033[1;33m[!] 进训练场，靠近人机，把准星瞄准【旁边的空气】，开枪！\033[0m\n");
+    printf("\n\033[1;42;37m[*] 标定器已启动！\033[0m\n");
+    printf("\033[1;33m[!] 请进训练场，走到人机面前。\033[0m\n");
+    printf("\033[1;31m[!] 【关键操作】：用你的准星，【手动死死瞄准人机的头部】，然后开一枪！\033[0m\n");
+    printf("\033[1;33m[!] 程序会瞬间抓取这一枪的真实 V3/V4，并与理论计算做对比。\033[0m\n");
     printf("\033[1;33m[!] 测试完按 'q' 退出。\033[0m\n");
     printf("--------------------------------------------------\n");
 
-    uint32_t write_indices[2] = {3, 4}; // V3(Pitch), V4(Yaw)
-    float write_values[2] = {0.0f, 0.0f};
+    uint32_t write_indices[2] = {3, 4};
+    float write_values[2] = {0.0f, 0.0f}; // 不修改，纯窃听
     uint8_t out_vregs[32][16];
+    
+    int last_firing_state = 0;
+    int shot_count = 0;
 
     while (g_Running) {
-        // --- 读取世界与自身 ---
+        // --- 1. 读取世界、相机、敌人，计算【理论角度】 ---
         uintptr_t p1 = drv.read_fast<uintptr_t>(base + 0xf1fb900);
         uintptr_t p2 = drv.read_fast<uintptr_t>(p1 + 0x810);
         uintptr_t UWorld = drv.read_fast<uintptr_t>(p2 + 0x78);
@@ -121,7 +124,6 @@ int main() {
         uintptr_t Uleve = drv.read_fast<uintptr_t>(UWorld + 0x30);
         uintptr_t Arrayaddr = drv.read_fast<uintptr_t>(Uleve + 0xA0);
         int Count = drv.read_fast<int>(Uleve + 0xA8);
-        if (Count <= 0 || Count > 2000) { usleep(5000); continue; }
 
         uintptr_t o1 = drv.read_fast<uintptr_t>(UWorld + 0x38);
         uintptr_t o2 = drv.read_fast<uintptr_t>(o1 + 0x78);
@@ -131,7 +133,6 @@ int main() {
 
         int MyTeam = drv.read_fast<int>(Oneself + 0x998);
         
-        // 相机坐标
         FVector CamPos = {0,0,0};
         uintptr_t cam1 = drv.read_fast<uintptr_t>(Oneself + 0x90);
         if (cam1 > 0x10000) {
@@ -143,8 +144,15 @@ int main() {
             if (RootComp > 0x10000) drv.read_fast(RootComp + 0x1c8, &CamPos, 12);
             CamPos.Z += 150.0f;
         }
+        
+        // 读取当前相机的绝对角度 (用于判断是否为相对角度)
+        uintptr_t PlayerController = drv.read_fast<uintptr_t>(Oneself + 0x2A0); 
+        if (PlayerController < 0x10000) PlayerController = Oneself;
+        FRotator cam_rot = drv.read_fast<FRotator>(PlayerController + 0x3A8);
+        if (cam_rot.Pitch < -90.0f || cam_rot.Pitch > 90.0f) {
+            cam_rot = drv.read_fast<FRotator>(PlayerController + 0x410);
+        }
 
-        // --- 寻找最近的人机 ---
         float minDist = 999999.0f;
         FVector bestHead = {0,0,0};
         bool found = false;
@@ -152,7 +160,6 @@ int main() {
         for (int i = 0; i < Count; i++) {
             uintptr_t Objaddr = drv.read_fast<uintptr_t>(Arrayaddr + 8 * i);
             if (Objaddr < 0x10000) continue;
-            
             int TeamID = drv.read_fast<int>(Objaddr + 0x998);
             if (TeamID == MyTeam && MyTeam != 0) continue; 
             if (drv.read_fast<float>(Objaddr + 0xe60) <= 0.0f) continue;
@@ -180,42 +187,54 @@ int main() {
             }
         }
 
-        // --- 计算绝对角度并注入 ---
+        float calc_pitch = 0.0f, calc_yaw = 0.0f;
         if (found) {
             float dx = bestHead.X - CamPos.X;
             float dy = bestHead.Y - CamPos.Y;
             float dz = bestHead.Z - CamPos.Z;
             float d2 = sqrt(dx*dx + dy*dy);
             if (d2 < 0.01f) d2 = 0.01f;
+            calc_pitch = atan2(dz, d2) * (180.0f / PI);
+            calc_yaw = atan2(dy, dx) * (180.0f / PI);
+        }
 
-            // 【核心】UE4 标准世界绝对角度计算
-            // 如果子弹往后飞，把 atan2(dy, dx) 改成 atan2(-dy, -dx) 或加 180度
-            write_values[0] = atan2(dz, d2) * (180.0f / PI); // Pitch -> V3
-            write_values[1] = atan2(dy, dx) * (180.0f / PI); // Yaw -> V4
+        // --- 2. 纳秒级窃听 V3/V4 (write_count = 0，只读不改) ---
+        drv.fpr_read_modify_write(pid, 0xFFFFFFFF, 0, write_indices, write_values, out_vregs);
 
-            // 128位无损注入 V3, V4
-            drv.fpr_read_modify_write(pid, 0xFFFFFFFF, 2, write_indices, write_values, out_vregs);
+        // --- 3. 检测开火瞬间，抓取真实数据 ---
+        int is_firing = drv.read_fast<int>(Oneself + 0x1830);
+        if (is_firing == 1 && last_firing_state == 0 && found) {
+            shot_count++;
+            
+            // 从窃听缓冲区提取开枪瞬间的真实 V3/V4
+            float real_pitch, real_yaw;
+            memcpy(&real_pitch, &out_vregs[3][0], sizeof(float));
+            memcpy(&real_yaw, &out_vregs[4][0], sizeof(float));
 
-            // 全线程 hwbp_enable
-            for (pid_t tid : tids) {
-                info.pid = tid;
-                info.is_write_fp_regs = true;
-                info.fp_reg_count = 2;
-                info.fp_reg_indices[0] = 3;
-                info.fp_reg_indices[1] = 4;
-                memcpy(info.fp_reg_values[0], out_vregs[3], 16);
-                memcpy(info.fp_reg_values[1], out_vregs[4], 16);
-                drv.hwbp_enable(&info);
-            }
+            printf("\n\033[1;41;37m================ 第 %d 枪 标定报告 ================\033[0m\n", shot_count);
+            printf("  当前相机绝对角度: Pitch=%.2f, Yaw=%.2f\n", cam_rot.Pitch, cam_rot.Yaw);
+            printf("  \033[1;33m[程序理论计算] (世界绝对角度): Pitch=%.2f, Yaw=%.2f\033[0m\n", calc_pitch, calc_yaw);
+            printf("  \033[1;32m[引擎真实使用] (开枪瞬间V3/V4): Pitch=%.2f, Yaw=%.2f\033[0m\n", real_pitch, real_yaw);
+            
+            printf("  \033[1;36m--- 误差分析 ---\033[0m\n");
+            printf("  Pitch 差值 (真实 - 理论): %.2f\n", real_pitch - calc_pitch);
+            printf("  Yaw 差值 (真实 - 理论): %.2f\n", real_yaw - calc_yaw);
+            printf("  Yaw 差值 (真实 - 相机Yaw): %.2f\n", real_yaw - cam_rot.Yaw);
+            printf("\033[1;41;37m==================================================\033[0m\n");
 
-            printf("\r\033[1;32m[锁定] 距离:%.1fm | Pitch:%.1f Yaw:%.1f   \033[0m", minDist, write_values[0], write_values[1]);
+            while (drv.read_fast<int>(Oneself + 0x1830) == 1) usleep(1000);
+        }
+        last_firing_state = is_firing;
+
+        if(found) {
+            printf("\r\033[1;32m[瞄准] 距离:%.1fm | 理论: P:%.1f Y:%.1f | 相机Yaw:%.1f   \033[0m", 
+                   minDist, calc_pitch, calc_yaw, cam_rot.Yaw);
             fflush(stdout);
         }
-        usleep(5000); // 5ms 刷新，降低内核压力
+        usleep(2000);
     }
 
-    printf("\n[*] 清理断点...\n");
     drv.hwbp_clear();
-    printf("[+] 安全退出！\n");
+    printf("\n[+] 安全退出！\n");
     return 0;
 }
