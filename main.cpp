@@ -54,7 +54,7 @@ int main() {
     system("setenforce 0");
     printf("========================================\n");
     printf(" 真·相机链路 白盒绝对角度锁头\n");
-    printf=" (使用 0x4b18 和 0x548 真实链路)\n");
+    printf(" (使用 0x4b18 和 0x548 真实链路)\n");
     printf("========================================\n");
 
     paradise_driver drv;
