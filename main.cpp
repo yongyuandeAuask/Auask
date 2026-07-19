@@ -3,13 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dirent.h>
-#include <vector>
 #include <pthread.h>
 
 volatile bool g_Running = true;
 
-// 终端输入监听线程 (按 q 退出)
+// 终端输入监听线程 (按 q 恢复并退出)
 void* InputThread(void* arg) {
     char buf[16];
     while(g_Running) {
@@ -26,8 +24,7 @@ void* InputThread(void* arg) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf(" ShootBulletInner 极简安全断点测试\n");
-    printf(" (纯记录模式，绝不修改寄存器，防卡死)\n");
+    printf("  ShootBulletInner 函数瘫痪测试 (RET注入)\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -35,95 +32,54 @@ int main() {
     if (pid <= 0) pid = drv.get_pid("com.rekoo.pubgm");
     if (pid <= 0) pid = drv.get_pid("com.vng.pubgmobile");
     if (pid <= 0) { printf("[-] 未找到游戏\n"); return 1; }
-    printf("[+] PID: %d\n", pid);
     drv.initialize(pid);
 
     uintptr_t base = drv.get_module_base("libUE4.so");
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
-    uintptr_t shoot_addr = base + 0x6DFE100;
-    printf("[+] 目标地址: 0x%lx\n", shoot_addr);
-
-    // 【防卡死核心 1】获取 TID，但最多只处理前 15 个线程，防止内核 perf_event 爆炸
-    std::vector<pid_t> tids;
-    char path[256];
-    sprintf(path, "/proc/%d/task", pid);
-    DIR* dir = opendir(path);
-    if (dir) {
-        struct dirent* entry;
-        while ((entry = readdir(dir)) != NULL && tids.size() < 15) {
-            if (entry->d_type == DT_DIR) {
-                pid_t tid = atoi(entry->d_name);
-                if (tid > 0) tids.push_back(tid);
-            }
-        }
-        closedir(dir);
-    }
-    if (tids.empty()) tids.push_back(pid); 
-
-    printf("[*] 准备给 %zu 个核心线程挂载纯记录断点...\n", tids.size());
     
-    int success = 0;
-    for (pid_t tid : tids) {
-        HW_BP_INFO info = {0};
-        info.pid = tid;
-        info.addr = shoot_addr;
-        info.type = HW_BP_TYPE_X; // 执行断点
-        info.len = 4;
-        
-        // 【防卡死核心 2】绝对不修改任何寄存器！纯旁路监听！
-        info.is_write_gp_regs = false;
-        info.is_write_fp_regs = false; 
-        
-        if (drv.hwbp_add(&info)) {
-            success++;
-        }
-    }
-    printf("[+] 成功挂载 %d 个纯记录断点。\n", success);
+    uintptr_t shoot_addr = base + 0x6DFE100;
+    printf("[+] 目标函数地址: 0x%lx\n", shoot_addr);
 
-    if (success == 0) {
-        printf("[-] 断点挂载失败，请检查驱动！\n");
-        return 1;
+    // 1. 备份原始指令
+    uint32_t original_insn = 0;
+    if (!drv.read(shoot_addr, &original_insn, 4)) {
+        printf("[-] 读取原始指令失败\n"); return 1;
+    }
+    printf("[+] 原始指令备份成功: 0x%08x\n", original_insn);
+
+    // 2. 注入 RET 指令 (0xD65F03C0)
+    uint32_t ret_insn = 0xD65F03C0; 
+    printf("[*] 正在注入 RET 指令 (函数瘫痪)...\n");
+    
+    if (drv.write(shoot_addr, ret_insn)) {
+        printf("\033[1;41;37m[!!! 注入成功] ShootBulletInner 已被瘫痪！\033[0m\n");
+    } else {
+        printf("[-] 注入失败，驱动无代码段写权限\n"); return 1;
     }
 
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;33m[!] 进游戏开枪测试。游戏绝对不会卡死或闪退。\033[0m\n");
-    printf("\033[1;33m[!] 测试完成后，在此终端输入 'q' 并回车安全退出。\033[0m\n");
+    printf("\n\033[1;33m[!] 验证时刻：\033[0m\n");
+    printf("\033[1;32m[!] 请进游戏，按住开火键！你应该【打不出任何子弹】！\033[0m\n");
+    printf("\033[1;33m[!] 验证完毕后，在此终端输入 'q' 并回车，函数将瞬间恢复正常。\033[0m\n");
     printf("--------------------------------------------------\n");
 
-    HWBP_HIT_ITEM hits[16];
-    HWBP_HIT_ARGS args = {0};
-    args.out_buf = hits;
-    args.out_len = sizeof(hits);
-
-    int total_hits = 0;
-
+    // 3. 等待退出并恢复
     while (g_Running) {
-        bool hit_this_round = false;
-        for (pid_t tid : tids) {
-            args.pid = tid;
-            args.addr = shoot_addr;
-            args.real_count = 0;
-            
-            // 获取触发记录
-            if (drv.hwbp_get_hits(&args) && args.real_count > 0) {
-                hit_this_round = true;
-                total_hits += args.real_count;
-                for (int i = 0; i < args.real_count; i++) {
-                    printf("\033[1;32m[触发] TID:%d | PC:0x%lx | X0:0x%lx | X1:0x%lx\033[0m\n", 
-                           hits[i].task_id, hits[i].regs_info.pc, 
-                           hits[i].regs_info.regs[0], hits[i].regs_info.regs[1]);
-                }
-            }
-        }
-        if (!hit_this_round) {
-            usleep(2000); // 没触发时稍微休眠，降低 CPU 占用
-        }
+        // 持续压制，防止反作弊热修复代码
+        drv.write(shoot_addr, ret_insn);
+        usleep(50000); 
     }
 
-    printf("\n[*] 总计触发 %d 次。正在清理断点...\n", total_hits);
-    drv.hwbp_clear();
-    printf("[+] 清理完毕，安全退出！\n");
+    // 4. 完美恢复
+    printf("\n[*] 正在恢复原始指令 (0x%08x)...\n", original_insn);
+    if (drv.write(shoot_addr, original_insn)) {
+        printf("\033[1;32m[+] 恢复成功！开枪功能已恢复正常。\033[0m\n");
+    } else {
+        printf("[-] 恢复失败，请重启游戏！\n");
+    }
+
+    printf("[+] 安全退出！\n");
     return 0;
 }
