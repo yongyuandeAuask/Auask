@@ -10,7 +10,7 @@
 #include <vector>
 #define PI 3.14159265358979323846f
 #define HEAD_BONE_IDX 6   // 打脖子/胸口改这里试 0/5/7
-volatile float g_yaw_offset=0, g_pitch_offset=0, g_drop=540.0f, g_bullet_speed=0.0f;
+volatile float g_yaw_offset=0, g_pitch_offset=0, g_drop=540.0f, g_bullet_speed=0.0f, g_fov_deg=25.0f;
 volatile bool g_yaw_invert=false, g_team_filter=true, g_skip_bot=false, g_Running=true;
 volatile bool g_capture=false, g_inject_q=false, g_verbose=false, g_swap_pv=false;
 static void sig_handler(int){ g_Running=false; const char m[]="\n[!] 退出清理中...\n"; write(STDERR_FILENO,m,sizeof(m)-1); }
@@ -20,6 +20,7 @@ void* InputThread(void*){
     printf(" b=反转Yaw l/r=Yaw±15 u/d=Pitch±5 数字=强制Yaw偏\n");
     printf(" o/p=下坠常数±20 t=队友过滤 g=跳人机\n");
     printf(" c=采样对照 v=注入源:%s s=实时行:%s x=交换P/Y:%s\n", g_inject_q?"准星Q":"aim", g_verbose?"开":"关", g_swap_pv?"开":"关");
+    printf(" \033[1;35mf=FOV+5 h=FOV-5 (当前:%.0f度 | 瞄谁打谁,没瞄不打)\033[0m\n", g_fov_deg);
     printf(" \033[1;31mq=清除断点退出(Ctrl+C同效)\033[0m\n\033[1;33m======================\033[0m\n");
     while(g_Running){
         if(!fgets(buf,sizeof(buf),stdin)) continue; char c=buf[0];
@@ -37,6 +38,8 @@ void* InputThread(void*){
         else if(c=='v'||c=='V'){g_inject_q=!g_inject_q;printf("\n\033[1;35m[v] 注入源:%s\033[0m\n",g_inject_q?"准星Q":"aim");}
         else if(c=='s'||c=='S'){g_verbose=!g_verbose;printf("\n\033[1;35m[s] 实时行:%s\033[0m\n",g_verbose?"开":"关");}
         else if(c=='x'||c=='X'){g_swap_pv=!g_swap_pv;printf("\n\033[1;35m[x] 交换P/Y:%s\033[0m\n",g_swap_pv?"开":"关");}
+        else if(c=='f'||c=='F'){g_fov_deg+=5;printf("\n\033[1;35m[*] FOV%.0f度 (锁太窄/瞄偏一点就不锁,按f加宽)\033[0m\n",g_fov_deg);}
+        else if(c=='h'||c=='H'){g_fov_deg-=5;if(g_fov_deg<5)g_fov_deg=5;printf("\n\033[1;35m[*] FOV%.0f度 (锁太宽/还锁旁边的,按h收窄)\033[0m\n",g_fov_deg);}
         else {float v=atof(buf);if(v!=0||buf[0]=='0'){g_yaw_offset=v;printf("\n[*] Y强制%.0f\n",g_yaw_offset);}}
     }
     return NULL;
@@ -100,8 +103,8 @@ int main(){
                 if(Cam>0x10000){ CamPos=drv.read_fast<FVector>(Cam+0x530); if(CamPos.X!=0||CamPos.Y!=0){cam_ok=true; Q_snap=drv.read_fast<FRotator>(Cam+0x554); q_valid=true;} }
                 if(cam_ok){
                     uintptr_t Uleve=drv.read_fast<uintptr_t>(UWorld+0x30),Arr=drv.read_fast<uintptr_t>(Uleve+0xA0); int Cnt=drv.read_fast<int>(Uleve+0xA8);
-                    minDist=999999; FVector best={0,0,0}; int loopN=Cnt; if(loopN<0)loopN=0; if(loopN>512)loopN=512;
-                    int c_see=0,c_fp=0,c_team=0,c_dead=0,c_mesh=0,c_ok=0;
+                    minDist=999999; float minAng=999999.0f; FVector best={0,0,0}; int loopN=Cnt; if(loopN<0)loopN=0; if(loopN>512)loopN=512;
+                    int c_see=0,c_fp=0,c_team=0,c_dead=0,c_mesh=0,c_ok=0,c_fov=0;
                     for(int i=0;i<loopN;i++){
                         uintptr_t O=drv.read_fast<uintptr_t>(Arr+8*i); if(O<0x10000||O==Oneself)continue;
                         c_see++;
@@ -119,10 +122,19 @@ int main(){
                         FVector H={fM[3][0],fM[3][1],fM[3][2]};
                         float dx=H.X-CamPos.X,dy=H.Y-CamPos.Y,dz=H.Z-CamPos.Z,dist=sqrt(dx*dx+dy*dy+dz*dz)*0.01f;
                         c_ok++;
-                        if(dist<minDist&&dist<300){minDist=dist;best=H;found=true;bestTeam=team;bestBot=isBot;}
+                        if(dist<300){
+                            float d2=sqrt(dx*dx+dy*dy); if(d2<0.01f)d2=0.01f;
+                            float ty=atan2(dy,dx)*(180.f/PI), tp=atan2(dz,d2)*(180.f/PI);
+                            if(g_yaw_invert) ty=-ty;
+                            ty+=g_yaw_offset; tp+=g_pitch_offset;
+                            float dyaw=fmodf(ty-Q_snap.Yaw+540.f,360.f)-180.f, dpitch=tp-Q_snap.Pitch;
+                            float ang=dyaw*dyaw+dpitch*dpitch, fov2=g_fov_deg*g_fov_deg;
+                            if(ang>=fov2){c_fov++;}
+                            else if(ang<minAng){minAng=ang;minDist=dist;best=H;found=true;bestTeam=team;bestBot=isBot;}
+                        }
                     }
                     static int tick_diag=0;
-                    if(++tick_diag>=50){tick_diag=0;printf("\n\033[1;36m[漏斗] 遍历%d 见%d 指纹%d 队杀%d 死杀%d 网格杀%d 合格%d -> found=%s\033[0m\n",loopN,c_see,c_fp,c_team,c_dead,c_mesh,c_ok,found?"Y":"N");}
+                    if(++tick_diag>=50){tick_diag=0;printf("\n\033[1;36m[漏斗] 遍历%d 见%d 指纹%d 队杀%d 死杀%d 网格杀%d 过过滤%d FOV杀%d -> found=%s\033[0m\n",loopN,c_see,c_fp,c_team,c_dead,c_mesh,c_ok,c_fov,found?"Y":"N");}
                     if(found){
                         if(g_bullet_speed>10.0f){ float _t=minDist/g_bullet_speed; best.Z+=g_drop*_t*_t; }
                         else if(!speed_warned){ speed_warned=true; printf("\n\033[1;31m[!] 子弹速度无效(%.1f)，下坠=0\033[0m\n",g_bullet_speed); }
@@ -142,7 +154,7 @@ int main(){
         for(auto&inf:infos){fill_inject(inf,fp,fy,inject);drv.hwbp_enable(&inf);}
         if(found!=last_found){ last_found=found; if(found) printf("\n\033[1;32m[+] 已锁定 %.1fm\033[0m\n",minDist); else printf("\n\033[1;33m[-] 目标丢失\033[0m\n"); }
         if(g_verbose&&++tick%10==0){
-            if(found) printf("\r\033[1;32m[追踪] %.1fm P%.1f Y%.1f 坠%.0f 速%.0f   \033[0m",minDist,aim_pitch,aim_yaw,g_drop,g_bullet_speed);
+            if(found) printf("\r\033[1;32m[追踪] %.1fm P%.1f Y%.1f 坠%.0f 速%.0f FOV%.0f   \033[0m",minDist,aim_pitch,aim_yaw,g_drop,g_bullet_speed,g_fov_deg);
             else if(cam_ok) printf("\r\033[1;33m[无目标]   \033[0m");
             else printf("\r\033[1;31m[无相机]   \033[0m");
             fflush(stdout);
