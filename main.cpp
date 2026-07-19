@@ -10,18 +10,58 @@
 
 #define PI 3.14159265358979323846f
 
-// 【完美修正 1】UE4 坐标系适配开关
-// 如果子弹往后飞，把 YAW_INVERT 改为 true
-// 如果子弹往左/右偏 90 度，调整 YAW_OFFSET 为 90.0 或 -90.0
-#define YAW_INVERT false  
-#define YAW_OFFSET 0.0f   
-
+// 【全局热调参变量】
+volatile float g_yaw_offset = 0.0f;   // Yaw 偏移量
+volatile bool g_yaw_invert = false;   // Yaw 是否反转 (往后飞)
+volatile float g_pitch_offset = 0.0f; // Pitch 偏移量
 volatile bool g_Running = true;
+
+// 【终端交互线程：实时修正弹道】
 void* InputThread(void* arg) {
-    char buf[16];
+    char buf[64];
+    printf("\n\033[1;33m========== 弹道热调参台 ==========\033[0m\n");
+    printf("  \033[1;31mb\033[0m = 子弹往后飞 (反转 Yaw)\n");
+    printf("  \033[1;32ml\033[0m = 子弹偏左 (Yaw +15°)\n");
+    printf("  \033[1;32mr\033[0m = 子弹偏右 (Yaw -15°)\n");
+    printf("  \033[1;34mu\033[0m = 子弹偏下 (Pitch +5°)\n");
+    printf("  \033[1;34md\033[0m = 子弹偏上 (Pitch -5°)\n");
+    printf("  直接输入数字(如 \033[1;35m90\033[0m, \033[1;35m-90\033[0m, \033[1;35m180\033[0m) = 强制设置 Yaw 偏移\n");
+    printf("  \033[1;31mq\033[0m = 退出程序\n");
+    printf("\033[1;33m==================================\033[0m\n");
+    
     while(g_Running) {
         if(fgets(buf, sizeof(buf), stdin)) {
-            if(buf[0] == 'q' || buf[0] == 'Q') { g_Running = false; break; }
+            if(buf[0] == 'q' || buf[0] == 'Q') { 
+                g_Running = false; 
+                break; 
+            }
+            else if(buf[0] == 'b' || buf[0] == 'B') { 
+                g_yaw_invert = !g_yaw_invert; 
+                printf("\033[1;32m[*] Yaw 反转: %s\033[0m\n", g_yaw_invert ? "开启(往后飞)" : "关闭"); 
+            }
+            else if(buf[0] == 'l' || buf[0] == 'L') { 
+                g_yaw_offset += 15.0f; 
+                printf("\033[1;32m[*] Yaw 偏移: %.1f° (向左修正)\033[0m\n", g_yaw_offset); 
+            }
+            else if(buf[0] == 'r' || buf[0] == 'R') { 
+                g_yaw_offset -= 15.0f; 
+                printf("\033[1;32m[*] Yaw 偏移: %.1f° (向右修正)\033[0m\n", g_yaw_offset); 
+            }
+            else if(buf[0] == 'u' || buf[0] == 'U') { 
+                g_pitch_offset += 5.0f; 
+                printf("\033[1;32m[*] Pitch 偏移: %.1f° (向上修正)\033[0m\n", g_pitch_offset); 
+            }
+            else if(buf[0] == 'd' || buf[0] == 'D') { 
+                g_pitch_offset -= 5.0f; 
+                printf("\033[1;32m[*] Pitch 偏移: %.1f° (向下修正)\033[0m\n", g_pitch_offset); 
+            }
+            else {
+                float val = atof(buf);
+                if (val != 0.0f || buf[0] == '0') {
+                    g_yaw_offset = val;
+                    printf("\033[1;32m[*] Yaw 偏移强制设置为: %.1f°\033[0m\n", g_yaw_offset);
+                }
+            }
         }
     }
     return NULL;
@@ -59,8 +99,7 @@ void MatrixMulti(const float A[4][4], const float B[4][4], float C[4][4]) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf(" 工业级完美版：PTE UXN 绝对角度追踪\n");
-    printf(" (单线程精准拦截 + 帧同步 + 坐标系修正)\n");
+    printf(" 工业级完美版：PTE UXN + 实时热调参\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -74,31 +113,28 @@ int main() {
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
     uintptr_t shoot_addr = base + 0x6DFE100;
 
-    // 【完美修正 2】只给主 PID (GameThread) 登记 PTE UXN 断点
-    // PTE 是页表级拦截，无需遍历 50 个子线程，彻底释放 CPU 性能
     HW_BP_INFO info = {0};
     info.pid = pid; 
     info.addr = shoot_addr;
-    info.type = HW_BP_TYPE_X; // 触发 PTE UXN
+    info.type = HW_BP_TYPE_X; 
     info.len = 4;
     
     if (!drv.hwbp_add(&info)) {
         printf("[-] PTE UXN 断点登记失败\n"); return 1;
     }
-    printf("[+] PTE UXN 断点已精准挂载至 GameThread\n");
+    printf("[+] PTE UXN 断点已精准挂载\n");
 
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;42;37m[*] 完美版追踪已激活！\033[0m\n");
-    printf("\033[1;33m[!] 进训练场，把准星瞄准【天上或地下】，开枪！\033[0m\n");
+    printf("\n\033[1;42;37m[*] 追踪已激活！请查看上方的【弹道热调参台】\033[0m\n");
+    printf("\033[1;33m[!] 进训练场，瞄准人机旁边的空气，开枪！根据弹道在终端输入指令修正！\033[0m\n");
     printf("--------------------------------------------------\n");
 
     uint32_t write_indices[2] = {3, 4}; 
     uint8_t out_vregs[32][16];
 
     while (g_Running) {
-        // 1. 获取基础指针
         uintptr_t p1 = drv.read_fast<uintptr_t>(base + 0xf1fb900);
         uintptr_t p2 = drv.read_fast<uintptr_t>(p1 + 0x810);
         uintptr_t UWorld = drv.read_fast<uintptr_t>(p2 + 0x78);
@@ -110,7 +146,6 @@ int main() {
         uintptr_t Oneself = drv.read_fast<uintptr_t>(o3 + 0x28c8);
         if (Oneself < 0x10000) { usleep(16000); continue; }
 
-        // 2. 真实相机链路 (0x4b18 -> 0x548)
         uintptr_t PlayerController = drv.read_fast<uintptr_t>(Oneself + 0x4b18);
         uintptr_t CameraPtr = drv.read_fast<uintptr_t>(PlayerController + 0x548);
         
@@ -127,7 +162,6 @@ int main() {
         }
         if (CamPos.X == 0 && CamPos.Y == 0) { usleep(16000); continue; }
 
-        // 3. 寻找最近的人机
         uintptr_t Uleve = drv.read_fast<uintptr_t>(UWorld + 0x30);
         uintptr_t Arrayaddr = drv.read_fast<uintptr_t>(Uleve + 0xA0);
         int Count = drv.read_fast<int>(Uleve + 0xA8);
@@ -165,7 +199,6 @@ int main() {
             }
         }
 
-        // 4. 【完美修正 3】帧同步计算与坐标系修正
         if (found) {
             float dx = bestHead.X - CamPos.X;
             float dy = bestHead.Y - CamPos.Y;
@@ -173,19 +206,20 @@ int main() {
             float d2 = sqrt(dx*dx + dy*dy);
             if (d2 < 0.01f) d2 = 0.01f;
 
+            // 【核心】计算基础角度
             float aim_pitch = atan2(dz, d2) * (180.0f / PI);
             float aim_yaw = atan2(dy, dx) * (180.0f / PI);
 
-            // 应用 UE4 坐标系修正
-            if (YAW_INVERT) aim_yaw = -aim_yaw;
-            aim_yaw += YAW_OFFSET;
+            // 【核心】应用终端实时输入的修正参数
+            if (g_yaw_invert) {
+                aim_yaw = -aim_yaw; // 反转 Yaw
+            }
+            aim_yaw += g_yaw_offset;
+            aim_pitch += g_pitch_offset;
 
             float write_values[2] = {aim_pitch, aim_yaw};
-            
-            // 128位无损准备
             drv.fpr_read_modify_write(pid, 0xFFFFFFFF, 2, write_indices, write_values, out_vregs);
 
-            // 【完美修正 4】只对主 PID 下发规则，且频率降低到 10ms (接近一帧)
             info.is_write_fp_regs = true;
             info.fp_reg_count = 2;
             info.fp_reg_indices[0] = 3;
@@ -193,14 +227,13 @@ int main() {
             memcpy(info.fp_reg_values[0], out_vregs[3], 16);
             memcpy(info.fp_reg_values[1], out_vregs[4], 16);
             
-            drv.hwbp_enable(&info); // 单线程下发，极致性能
+            drv.hwbp_enable(&info);
 
-            printf("\r\033[1;32m[Magic Bullet] 距:%.1fm | 绝对角度 P:%.1f Y:%.1f   \033[0m", 
-                   minDist, aim_pitch, aim_yaw);
+            // 实时显示当前应用的角度和修正参数
+            printf("\r\033[1;32m[Magic] 距:%.1fm | 注入 P:%.1f Y:%.1f | 修正: 反转=%s Y偏=%.0f P偏=%.0f   \033[0m", 
+                   minDist, aim_pitch, aim_yaw, g_yaw_invert?"T":"F", g_yaw_offset, g_pitch_offset);
             fflush(stdout);
         }
-        
-        // 帧同步休眠 (10ms)，告别 5ms 暴力轮询
         usleep(10000); 
     }
 
