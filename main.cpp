@@ -10,14 +10,16 @@
 #include <vector>
 
 #define PI 3.14159265358979323846f
-#define HEAD_BONE_IDX 6   // 头部在 component-space 骨骼数组的索引；若打偏胸/颈，调这里
+// 头部在 component-space 骨骼数组的索引。绘制.cpp 靠内部映射表把"头"映射到骨骼坐标[0]，
+// 我手头没有那张表，故用经验值。若子弹打脖子/胸口而非头，改这里试 0/5/7。
+#define HEAD_BONE_IDX 6
 
 // ===== 全局热调参 / 开关 =====
 volatile float g_yaw_offset   = 0.0f;
 volatile bool  g_yaw_invert   = false;
 volatile float g_pitch_offset = 0.0f;
-volatile bool  g_team_filter  = true;   // 队友过滤：默认开（带保护，训练场安全）
-volatile bool  g_skip_bot     = false;  // 跳人机：默认关（训练场目标就是人机！实战按 g 开）
+volatile bool  g_team_filter  = true;    // 队友过滤：默认开（带 selfTeam 保护，训练场安全）
+volatile bool  g_skip_bot     = false;   // 跳人机：默认关（训练场目标就是人机！实战按 g 开）
 volatile bool  g_Running      = true;
 
 static void sig_handler(int){
@@ -146,7 +148,7 @@ int main(){
             uintptr_t pF=drv.read_fast<uintptr_t>(pE+0x30);
             uintptr_t Oneself=drv.read_fast<uintptr_t>(pF+0x28c8);
             if(Oneself>0x10000){
-                int selfTeam=drv.read_fast<int>(Oneself+0x998);   // 自身队伍（队友过滤用）
+                int selfTeam=drv.read_fast<int>(Oneself+0x998);
 
                 // ---- 玩家控制器 -> 相机（0x4b18 / 0x548，绘制.cpp 验证）----
                 uintptr_t PC =drv.read_fast<uintptr_t>(Oneself+0x4b18);
@@ -164,47 +166,51 @@ int main(){
                     uintptr_t Uleve=drv.read_fast<uintptr_t>(UWorld+0x30);
                     uintptr_t Arr  =drv.read_fast<uintptr_t>(Uleve+0xA0);
                     int Cnt        =drv.read_fast<int>(Uleve+0xA8);
-                    minDist=999999; FVector best={0,0,0};
 
-                    for(int i=0;i<Cnt&&i<100;i++){
+                    minDist=999999; FVector best={0,0,0};
+                    int loopN = Cnt; if(loopN<0) loopN=0; if(loopN>512) loopN=512;   // ★ 不再砍到100
+                    int c_see=0, c_fp=0, c_team=0, c_dead=0, c_mesh=0, c_ok=0;       // 漏斗计数
+                    for(int i=0;i<loopN;i++){
                         uintptr_t O=drv.read_fast<uintptr_t>(Arr+8*i);
                         if(O<0x10000||O==Oneself)continue;
-
+                        c_see++;
+                        // ★ 人物指纹（绘制.cpp 核心：+0x2b78==479.5），非人物(车/盒/特效)直接跳
+                        float fp=drv.read_fast<float>(O+0x2b78);
+                        if(fp!=479.5f) continue;
+                        c_fp++;
                         // 队友过滤（带保护：自身队伍无效时不跳，防训练场误杀）
-                        if(g_team_filter){
-                            int team=drv.read_fast<int>(O+0x998);
-                            if(selfTeam!=0 && selfTeam!=-1 && team==selfTeam) continue;
-                        }
-                        // 死亡/倒地过滤（绘制.cpp: 状态 1048592/1048576 跳过）
+                        int team=drv.read_fast<int>(O+0x998);
+                        if(g_team_filter && selfTeam!=0 && selfTeam!=-1 && team==selfTeam){ c_team++; continue; }
+                        // 死亡/倒地过滤（绘制.cpp：状态 1048592/1048576 跳过）
                         int status=drv.read_fast<int>(O+0x1058);
-                        if(status==1048592 || status==1048576) continue;
-                        // 血量过滤
-                        float hp=drv.read_fast<float>(O+0xe60);
-                        if(hp<=0.0f || hp>200.0f) continue;
-                        // 人机判断（绘制.cpp: +0xa59 的三个魔数；开关默认关）
-                        int team2=drv.read_fast<int>(O+0x998);
+                        if(status==1048592 || status==1048576){ c_dead++; continue; }
+                        // 人机（默认关，训练场别开）
                         int botFlag=drv.read_fast<int>(O+0xa59);
-                        bool isBot=(team2!=0 && (botFlag==16842753||botFlag==16843009||botFlag==16843008));
+                        bool isBot=(team!=0 && (botFlag==16842753||botFlag==16843009||botFlag==16843008));
                         if(g_skip_bot && isBot) continue;
-
-                        // 骨骼 -> 头部世界坐标（Mesh 偏移与绘制.cpp 一致）
+                        // ★ 不再用血量(0,200]过滤！绘制.cpp 主链不过滤血量，会误杀活人机
+                        // 骨骼（安全网，真人物必过）
                         uintptr_t Mesh=drv.read_fast<uintptr_t>(O+0x510);
-                        if(Mesh<0x10000)continue;
+                        if(Mesh<0x10000){ c_mesh++; continue; }
                         uintptr_t BB=drv.read_fast<uintptr_t>(Mesh+0x9a8)+0x30;
-                        if(BB<0x10000)continue;
+                        if(BB<0x10000){ c_mesh++; continue; }
                         FTransform mT,hT;
                         getBone(&drv,Mesh+0x210,mT);
                         getBone(&drv,BB+HEAD_BONE_IDX*48,hT);
                         float c2w[4][4],bM[4][4],fM[4][4];
                         T2M(mT,c2w); T2M(hT,bM); MM(bM,c2w,fM);
                         FVector H={fM[3][0],fM[3][1],fM[3][2]};   // 不再 +7，与绘制.cpp 一致
-
                         float dx=H.X-CamPos.X,dy=H.Y-CamPos.Y,dz=H.Z-CamPos.Z;
                         float dist=sqrt(dx*dx+dy*dy+dz*dz)*0.01f;
-                        if(dist<minDist&&dist<300){
-                            minDist=dist; best=H; found=true;
-                            bestTeam=team2; bestBot=isBot;
-                        }
+                        c_ok++;
+                        if(dist<minDist&&dist<300){ minDist=dist; best=H; found=true; bestTeam=team; bestBot=isBot; }
+                    }
+                    // ★ 漏斗：每约0.5s 打印一次，活目标卡在哪一环一目了然
+                    static int tick_diag=0;
+                    if(++tick_diag>=50){
+                        tick_diag=0;
+                        printf("\n\033[1;36m[漏斗] 遍历%d 见%d 指纹%d 队杀%d 死杀%d 网格杀%d 合格%d -> found=%s\033[0m\n",
+                               loopN, c_see, c_fp, c_team, c_dead, c_mesh, c_ok, found?"Y":"N");
                     }
                     if(found){
                         float dx=best.X-CamPos.X,dy=best.Y-CamPos.Y,dz=best.Z-CamPos.Z;
@@ -228,8 +234,7 @@ int main(){
                        bestTeam, bestBot?"(机)":"",
                        g_team_filter?"开":"关", g_skip_bot?"开":"关");
             else if(cam_ok)
-                printf("\r\033[1;33m[无目标] 相机OK 但无合法目标(全死/被过滤) 队过滤=%s 跳人机=%s   \033[0m",
-                       g_team_filter?"开":"关", g_skip_bot?"开":"关");
+                printf("\r\033[1;33m[无目标] 相机OK 但无合法目标(看上方漏斗)   \033[0m");
             else
                 printf("\r\033[1;31m[无相机] Cam+0x530 读不到坐标，确认人在局内   \033[0m");
             fflush(stdout);
