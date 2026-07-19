@@ -7,7 +7,7 @@
 
 volatile bool g_Running = true;
 
-// 终端输入监听线程 (按 q 恢复并退出)
+// 终端输入监听 (按 q 安全退出)
 void* InputThread(void* arg) {
     char buf[16];
     while(g_Running) {
@@ -24,7 +24,8 @@ void* InputThread(void* arg) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf("  ShootBulletInner 函数瘫痪测试 (RET注入)\n");
+    printf(" V3 寄存器 128位无损微创注入测试\n");
+    printf(" (保留高96位，彻底杜绝引擎NaN闪退)\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -32,54 +33,65 @@ int main() {
     if (pid <= 0) pid = drv.get_pid("com.rekoo.pubgm");
     if (pid <= 0) pid = drv.get_pid("com.vng.pubgmobile");
     if (pid <= 0) { printf("[-] 未找到游戏\n"); return 1; }
+    printf("[+] PID: %d\n", pid);
     drv.initialize(pid);
 
     uintptr_t base = drv.get_module_base("libUE4.so");
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
-    
     uintptr_t shoot_addr = base + 0x6DFE100;
-    printf("[+] 目标函数地址: 0x%lx\n", shoot_addr);
 
-    // 1. 备份原始指令
-    uint32_t original_insn = 0;
-    if (!drv.read(shoot_addr, &original_insn, 4)) {
-        printf("[-] 读取原始指令失败\n"); return 1;
-    }
-    printf("[+] 原始指令备份成功: 0x%08x\n", original_insn);
-
-    // 2. 注入 RET 指令 (0xD65F03C0)
-    uint32_t ret_insn = 0xD65F03C0; 
-    printf("[*] 正在注入 RET 指令 (函数瘫痪)...\n");
+    // 1. 【核心】读取 V3 完整的 128 位 (16字节) 原始快照
+    uint8_t vregs[32][16] = {0};
+    uint32_t fpsr, fpcr;
+    uint32_t mask = (1 << 3); // 只读 V3
     
-    if (drv.write(shoot_addr, ret_insn)) {
-        printf("\033[1;41;37m[!!! 注入成功] ShootBulletInner 已被瘫痪！\033[0m\n");
-    } else {
-        printf("[-] 注入失败，驱动无代码段写权限\n"); return 1;
+    if (!drv.fpr_read(pid, mask, vregs, &fpsr, &fpcr)) {
+        printf("[-] fpr_read 失败\n"); return 1;
     }
+    printf("[+] 成功读取 V3 完整 128 位快照\n");
+
+    // 2. 【微创手术】只修改低 32 位 (S3 = Pitch)，高 96 位保持原样！
+    float pitch_sky = -89.0f; 
+    memcpy(&vregs[3][0], &pitch_sky, sizeof(float)); 
+
+    // 3. 配置硬件断点 (只给主线程挂，防卡死)
+    HW_BP_INFO info = {0};
+    info.pid = pid; 
+    info.addr = shoot_addr;
+    info.type = HW_BP_TYPE_X;
+    info.len = 4;
+    
+    info.is_write_fp_regs = true;
+    info.fp_reg_count = 1;
+    info.fp_reg_indices[0] = 3; // 锁定 V3
+    
+    // 将完整的 16 字节 (包含保留的高 96 位) 传给内核
+    memcpy(info.fp_reg_values[0], vregs[3], 16);
+
+    // 4. 注册并激活 (只调用一次！)
+    if (!drv.hwbp_add(&info)) {
+        printf("[-] hwbp_add 失败\n"); return 1;
+    }
+    if (!drv.hwbp_enable(&info)) {
+        printf("[-] hwbp_enable 失败\n"); return 1;
+    }
+    
+    printf("\033[1;42;37m[+] 128位无损篡改已激活！V3(Pitch) 已锁定为 -89.0f\033[0m\n");
 
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;33m[!] 验证时刻：\033[0m\n");
-    printf("\033[1;32m[!] 请进游戏，按住开火键！你应该【打不出任何子弹】！\033[0m\n");
-    printf("\033[1;33m[!] 验证完毕后，在此终端输入 'q' 并回车，函数将瞬间恢复正常。\033[0m\n");
+    printf("\n\033[1;33m[!] 进游戏，把准星瞄准【地板】，然后开一枪！\033[0m\n");
+    printf("\033[1;33m[!] 如果子弹射向天空且【不闪退】，说明我们彻底征服了底层！\033[0m\n");
+    printf("\033[1;33m[!] 测试完成后，输入 'q' 并回车安全退出。\033[0m\n");
     printf("--------------------------------------------------\n");
 
-    // 3. 等待退出并恢复
     while (g_Running) {
-        // 持续压制，防止反作弊热修复代码
-        drv.write(shoot_addr, ret_insn);
-        usleep(50000); 
+        usleep(100000); 
     }
 
-    // 4. 完美恢复
-    printf("\n[*] 正在恢复原始指令 (0x%08x)...\n", original_insn);
-    if (drv.write(shoot_addr, original_insn)) {
-        printf("\033[1;32m[+] 恢复成功！开枪功能已恢复正常。\033[0m\n");
-    } else {
-        printf("[-] 恢复失败，请重启游戏！\n");
-    }
-
-    printf("[+] 安全退出！\n");
+    printf("\n[*] 正在清理断点...\n");
+    drv.hwbp_clear();
+    printf("[+] 清理完毕，安全退出！\n");
     return 0;
 }
