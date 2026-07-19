@@ -3,9 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#include <dirent.h>
+#include <vector>
 #include <pthread.h>
-#include <stdint.h>
 
 volatile bool g_Running = true;
 
@@ -22,8 +22,8 @@ void* InputThread(void* arg) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf(" ARM64 Inline Hook 终极锁头 (射天版)\n");
-    printf(" (彻底抛弃HWBP，直接篡改代码段)\n");
+    printf(" Paradise PTE UXN 断点终极激活修复器\n");
+    printf(" (针对页表异常拦截，全量线程覆盖)\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -35,98 +35,83 @@ int main() {
 
     uintptr_t base = drv.get_module_base("libUE4.so");
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
-    
-    uintptr_t target_addr = base + 0x6DFE100; // ShootBulletInner
-    printf("[+] 目标函数: 0x%lx\n", target_addr);
+    uintptr_t shoot_addr = base + 0x6DFE100;
 
-    // 1. 备份原始的前 16 字节指令 (用于退出时恢复)
-    uint8_t original_code[16];
-    if(!drv.read(target_addr, original_code, 16)) {
-        printf("[-] 读取原始代码失败\n"); return 1;
+    // 1. 获取所有 TID (PTE UXN 不占硬件槽位，全挂也不会卡死)
+    std::vector<pid_t> tids;
+    char path[256];
+    sprintf(path, "/proc/%d/task", pid);
+    DIR* dir = opendir(path);
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type == DT_DIR) {
+                pid_t tid = atoi(entry->d_name);
+                if (tid > 0) tids.push_back(tid);
+            }
+        }
+        closedir(dir);
     }
-    printf("[+] 原始代码备份成功\n");
+    printf("[+] 发现 %zu 个线程，开始全量登记 PTE UXN 断点...\n", tids.size());
 
-    // 2. 分配一块可执行内存 (黑屋 Shellcode)
-    // 需要 PROT_READ | PROT_WRITE | PROT_EXEC
-    void* hook_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, 
-                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (hook_mem == MAP_FAILED) {
-        printf("[-] mmap 分配可执行内存失败\n"); return 1;
+    // 2. 全量登记 hwbp_add
+    HW_BP_INFO info = {0};
+    info.addr = shoot_addr;
+    info.type = HW_BP_TYPE_X;
+    info.len = 4;
+    
+    int add_count = 0;
+    for (pid_t tid : tids) {
+        info.pid = tid;
+        if (drv.hwbp_add(&info)) add_count++;
     }
-    printf("[+] Shellcode 内存分配成功: %p\n", hook_mem);
+    printf("[+] 成功登记 %d 个 PTE UXN 拦截点！\n", add_count);
 
-    // 3. 构造 ARM64 Shellcode (核心魔法)
-    // 逻辑：读取后面的 -89.0f 到 S3 (V3的低32位) -> 执行原函数第一条指令 -> 跳回原地址+4
-    uint8_t shellcode[] = {
-        // LDR S3, [PC, #8]  (机器码: 1D 00 00 1C) -> 把 -89.0f 加载到 V3 (Pitch)
-        0x1D, 0x00, 0x00, 0x1C, 
-        
-        // [原函数的第一条指令] (占位符，稍后从 original_code 复制)
-        0x00, 0x00, 0x00, 0x00, 
-        
-        // LDR X16, #8       (机器码: 50 00 00 58)
-        0x50, 0x00, 0x00, 0x58,
-        // BR X16            (机器码: 00 02 1F D6)
-        0x00, 0x02, 0x1F, 0xD6,
-        
-        // [8字节] 跳回的地址 (target_addr + 4)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        
-        // [4字节] 数据: -89.0f (垂直朝天)
-        0x00, 0x00, 0xB2, 0xC2 
-    };
+    // 3. 准备 Tracking 数据 (喂入正上方 10000 单位)
+    TRACKING_DATA track = {0};
+    track.is_active = true;
+    track.bp_addr = shoot_addr;
+    track.x = 0.0f;
+    track.y = 0.0f;
+    track.z = 10000.0f; 
 
-    // 填充原函数的第一条指令
-    memcpy(shellcode + 4, original_code, 4);
-    
-    // 填充跳回的地址 (target_addr + 4)
-    uint64_t return_addr = target_addr + 4;
-    memcpy(shellcode + 16, &return_addr, 8);
-
-    // 将 Shellcode 写入我们分配的可执行内存
-    memcpy(hook_mem, shellcode, sizeof(shellcode));
-    
-    // 【关键】使用驱动的 write_fast 将 Shellcode 同步到游戏进程的内存空间
-    // (因为 mmap 是当前进程的，我们需要把它写入目标游戏的内存，或者直接用当前进程的地址如果驱动支持跨进程执行)
-    // 为了最稳定，我们直接用驱动把 Shellcode 写入游戏内存的某个空闲区，这里简化处理，假设驱动能直接跳转
-    // 更稳妥的做法：直接用驱动在游戏内存里找一个 cave 写入，这里我们用当前进程的 hook_mem 测试驱动的跳转能力
-    
-    uintptr_t shellcode_addr = (uintptr_t)hook_mem;
-
-    // 4. 构造跳转指令 (覆盖 0x6DFE100 的前 12 字节)
-    // LDR X16, #8  (50 00 00 58)
-    // BR X16       (00 02 1F D6)
-    // .quad shellcode_addr
-    uint8_t jump_insn[16] = {
-        0x50, 0x00, 0x00, 0x58, 
-        0x00, 0x02, 0x1F, 0xD6
-    };
-    memcpy(jump_insn + 8, &shellcode_addr, 8);
-
-    // 5. 实施 Inline Hook (代码段强写！)
-    printf("[*] 正在注入 Inline Hook 跳转指令...\n");
-    if(drv.write(target_addr, jump_insn, 16)) {
-        printf("\033[1;42;37m[!!!] Inline Hook 注入成功！代码段已被劫持！\033[0m\n");
-    } else {
-        printf("[-] 注入失败\n"); return 1;
-    }
+    // 4. 准备 V3 寄存器修改数据 (-89.0f)
+    uint32_t reg_indices[1] = {3}; // V3
+    float reg_values[1] = {-89.0f};
 
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;33m[!] 进游戏，把准星瞄准【地板】，然后开枪！\033[0m\n");
-    printf("\033[1;33m[!] 子弹必须垂直射向天空！(反作弊无法拦截 Inline Hook)\033[0m\n");
-    printf("\033[1;33m[!] 测试完成后，输入 'q' 并回车安全恢复代码。\033[0m\n");
+    printf("\n\033[1;42;37m[*] 双轨激活系统已启动！\033[0m\n");
+    printf("\033[1;33m[!] 进游戏，把准星瞄准【地板】，然后开枪！\033[0m\n");
+    printf("\033[1;33m[!] 测试完成后，输入 'q' 并回车安全退出。\033[0m\n");
     printf("--------------------------------------------------\n");
 
+    // 5. 死循环：持续下发 Enable 和 Tracking (核心修复逻辑)
     while (g_Running) {
-        usleep(100000);
+        // 轨道 A：持续调用 hwbp_update_tracking (喂坐标)
+        drv.hwbp_update_tracking(&track);
+
+        // 轨道 B：持续对所有线程调用 hwbp_enable (强行改 V3)
+        for (pid_t tid : tids) {
+            info.pid = tid;
+            info.is_write_fp_regs = true;
+            info.fp_reg_count = 1;
+            info.fp_reg_indices[0] = 3;
+            // 将 -89.0f 放入低 32 位
+            memcpy(&info.fp_reg_values[0][0], &reg_values[0], sizeof(float));
+            
+            drv.hwbp_enable(&info);
+        }
+        
+        // 轨道 C：使用 fpr_write_floats 辅助注入 (防止 enable 被内核吞掉)
+        drv.fpr_write_floats(pid, 1, reg_indices, reg_values);
+
+        usleep(2000); // 2ms 高频刷新，确保异常触发时规则一定在内存中
     }
 
-    // 6. 完美恢复 (防止游戏崩溃或封号)
-    printf("\n[*] 正在恢复原始汇编指令...\n");
-    drv.write(target_addr, original_code, 16);
-    munmap(hook_mem, 4096);
-    printf("[+] 代码已完美恢复，安全退出！\n");
+    printf("\n[*] 正在清理 PTE UXN 断点...\n");
+    drv.hwbp_clear();
+    printf("[+] 页表已恢复，安全退出！\n");
     return 0;
 }
