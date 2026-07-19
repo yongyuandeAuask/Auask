@@ -8,12 +8,23 @@
 #include <pthread.h>
 
 volatile bool g_Running = true;
+volatile float g_aim_pitch = 89.0f; // 【核心】默认改为 89.0f (抬头)
 
+// 终端交互线程：实时修改 Pitch 值
 void* InputThread(void* arg) {
-    char buf[16];
+    char buf[64];
+    printf("\n\033[1;33m[调参台] 请输入 Pitch 角度 (如 89, -45, 0)，按回车生效。\033[0m\n");
+    printf("\033[1;33m[调参台] 输入 'q' 退出程序。\033[0m\n");
+    
     while(g_Running) {
         if(fgets(buf, sizeof(buf), stdin)) {
-            if(buf[0] == 'q' || buf[0] == 'Q') { g_Running = false; break; }
+            if(buf[0] == 'q' || buf[0] == 'Q') { 
+                g_Running = false; 
+                break; 
+            }
+            float val = atof(buf);
+            g_aim_pitch = val;
+            printf("\033[1;32m[*] V3 (Pitch) 已锁定为: %.2f (请进游戏开枪测试)\033[0m\n", g_aim_pitch);
         }
     }
     return NULL;
@@ -22,8 +33,8 @@ void* InputThread(void* arg) {
 int main() {
     system("setenforce 0");
     printf("========================================\n");
-    printf(" Paradise PTE UXN 断点终极激活修复器\n");
-    printf(" (针对页表异常拦截，全量线程覆盖)\n");
+    printf(" PTE UXN 断点 V3 交互式调参台\n");
+    printf(" (纯手动篡改 V3，关闭 Tracking 干扰)\n");
     printf("========================================\n");
 
     paradise_driver drv;
@@ -37,7 +48,7 @@ int main() {
     if (base == 0) { printf("[-] 获取基址失败\n"); return 1; }
     uintptr_t shoot_addr = base + 0x6DFE100;
 
-    // 1. 获取所有 TID (PTE UXN 不占硬件槽位，全挂也不会卡死)
+    // 1. 获取所有 TID 并全量登记断点
     std::vector<pid_t> tids;
     char path[256];
     sprintf(path, "/proc/%d/task", pid);
@@ -52,66 +63,53 @@ int main() {
         }
         closedir(dir);
     }
-    printf("[+] 发现 %zu 个线程，开始全量登记 PTE UXN 断点...\n", tids.size());
 
-    // 2. 全量登记 hwbp_add
     HW_BP_INFO info = {0};
     info.addr = shoot_addr;
     info.type = HW_BP_TYPE_X;
     info.len = 4;
     
-    int add_count = 0;
     for (pid_t tid : tids) {
         info.pid = tid;
-        if (drv.hwbp_add(&info)) add_count++;
+        drv.hwbp_add(&info);
     }
-    printf("[+] 成功登记 %d 个 PTE UXN 拦截点！\n", add_count);
 
-    // 3. 准备 Tracking 数据 (喂入正上方 10000 单位)
+    // 2. 【关键】彻底关闭 Tracking API，防止它覆盖我们的 V3 修改
     TRACKING_DATA track = {0};
-    track.is_active = true;
+    track.is_active = false; 
     track.bp_addr = shoot_addr;
-    track.x = 0.0f;
-    track.y = 0.0f;
-    track.z = 10000.0f; 
-
-    // 4. 准备 V3 寄存器修改数据 (-89.0f)
-    uint32_t reg_indices[1] = {3}; // V3
-    float reg_values[1] = {-89.0f};
+    drv.hwbp_update_tracking(&track);
 
     pthread_t tid_input;
     pthread_create(&tid_input, NULL, InputThread, NULL);
 
-    printf("\n\033[1;42;37m[*] 双轨激活系统已启动！\033[0m\n");
-    printf("\033[1;33m[!] 进游戏，把准星瞄准【地板】，然后开枪！\033[0m\n");
-    printf("\033[1;33m[!] 测试完成后，输入 'q' 并回车安全退出。\033[0m\n");
+    printf("\n\033[1;42;37m[*] 调参台已启动！当前 V3 = %.2f\033[0m\n", g_aim_pitch);
     printf("--------------------------------------------------\n");
 
-    // 5. 死循环：持续下发 Enable 和 Tracking (核心修复逻辑)
+    // 3. 死循环高频注入 V3
+    uint32_t reg_indices[1] = {3}; // 锁定 V3
+    
     while (g_Running) {
-        // 轨道 A：持续调用 hwbp_update_tracking (喂坐标)
-        drv.hwbp_update_tracking(&track);
-
-        // 轨道 B：持续对所有线程调用 hwbp_enable (强行改 V3)
+        float current_pitch = g_aim_pitch;
+        
         for (pid_t tid : tids) {
             info.pid = tid;
             info.is_write_fp_regs = true;
             info.fp_reg_count = 1;
             info.fp_reg_indices[0] = 3;
-            // 将 -89.0f 放入低 32 位
-            memcpy(&info.fp_reg_values[0][0], &reg_values[0], sizeof(float));
+            memcpy(&info.fp_reg_values[0][0], &current_pitch, sizeof(float));
             
             drv.hwbp_enable(&info);
         }
         
-        // 轨道 C：使用 fpr_write_floats 辅助注入 (防止 enable 被内核吞掉)
-        drv.fpr_write_floats(pid, 1, reg_indices, reg_values);
+        // 辅助注入
+        drv.fpr_write_floats(pid, 1, reg_indices, &current_pitch);
 
-        usleep(2000); // 2ms 高频刷新，确保异常触发时规则一定在内存中
+        usleep(2000); // 2ms 刷新
     }
 
-    printf("\n[*] 正在清理 PTE UXN 断点...\n");
+    printf("\n[*] 清理断点...\n");
     drv.hwbp_clear();
-    printf("[+] 页表已恢复，安全退出！\n");
+    printf("[+] 安全退出！\n");
     return 0;
 }
