@@ -10,13 +10,10 @@
 #include <vector>
 
 #define PI 3.14159265358979323846f
-#define MAGIC_PITCH 85.0f
-#define MAGIC_YAW   90.0f
 
 volatile float g_yaw_offset   = 0.0f;
 volatile bool  g_yaw_invert   = false;
 volatile float g_pitch_offset = 0.0f;
-volatile int   g_mode         = 0;
 volatile bool  g_Running      = true;
 
 static void sig_handler(int){
@@ -28,15 +25,15 @@ static void sig_handler(int){
 void* InputThread(void*){
     char buf[64];
     printf("\n\033[1;33m========== 弹道控制台 ==========\033[0m\n");
-    printf("  m=切换瞄准/魔数  b=反转Yaw  l=Yaw+15  r=Yaw-15\n");
-    printf("  u=Pitch+5  d=Pitch-5  数字=强制Yaw偏移\n");
+    printf("  \033[1;32m默认自动追踪最近目标，无需按键。\033[0m\n");
+    printf("  b=反转Yaw  l=Yaw+15  r=Yaw-15  u=Pitch+5  d=Pitch-5\n");
+    printf("  数字(如 90/-90)=强制Yaw偏移\n");
     printf("  \033[1;31mq=清除断点并结束 (Ctrl+C 同效)\033[0m\n");
     printf("\033[1;33m==================================\033[0m\n");
     while(g_Running){
         if(!fgets(buf,sizeof(buf),stdin)) continue;
         char c=buf[0];
         if(c=='q'||c=='Q'){ g_Running=false; printf("\n\033[1;31m[q] 退出中...\033[0m\n"); break; }
-        else if(c=='m'||c=='M'){ g_mode=!g_mode; printf("\n\033[1;32m[*] 模式: %s\033[0m\n", g_mode?"魔数":"瞄准"); }
         else if(c=='b'||c=='B'){ g_yaw_invert=!g_yaw_invert; printf("\n\033[1;32m[*] Yaw反转: %s\033[0m\n", g_yaw_invert?"开":"关"); }
         else if(c=='l'||c=='L'){ g_yaw_offset+=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n", g_yaw_offset); }
         else if(c=='r'||c=='R'){ g_yaw_offset-=15; printf("\n\033[1;32m[*] Yaw偏: %.0f\033[0m\n", g_yaw_offset); }
@@ -76,6 +73,7 @@ static std::vector<pid_t> enum_tids(pid_t pid){
     closedir(d); return v;
 }
 
+// inject=false 时不写寄存器，子弹按原弹道飞（无目标时放行）
 static void fill_inject(HW_BP_INFO& info,float p,float y,bool inject){
     info.is_write_gp_regs=false;
     info.is_write_fp_regs=inject;
@@ -126,7 +124,10 @@ int main(){
 
     int tick=0;
     while(g_Running){
-        float aim_pitch=0, aim_yaw=0; bool found=false; float minDist=0;
+        float aim_pitch=0, aim_yaw=0;
+        bool found=false, cam_ok=false;
+        float minDist=0;
+
         uintptr_t p1=drv.read_fast<uintptr_t>(base+0xf1fb900);
         uintptr_t p2=drv.read_fast<uintptr_t>(p1+0x810);
         uintptr_t UWorld=drv.read_fast<uintptr_t>(p2+0x78);
@@ -148,6 +149,7 @@ int main(){
                     }
                 }
                 if(CamPos.X!=0||CamPos.Y!=0){
+                    cam_ok=true;   // ★ 相机位置读到了
                     uintptr_t Lv=drv.read_fast<uintptr_t>(UWorld+0x30);
                     uintptr_t Arr=drv.read_fast<uintptr_t>(Lv+0xA0);
                     int Cnt=drv.read_fast<int>(Lv+0xA8);
@@ -180,22 +182,18 @@ int main(){
             }
         }
 
-        float fp, fy;
-        if(g_mode==1){ fp=MAGIC_PITCH; fy=MAGIC_YAW; }
-        else if(found){ fp=aim_pitch; fy=aim_yaw; }
-        else { fp=0; fy=0; }
-        bool inject = (g_mode==1) || found;
+        // 有目标才注入，否则放行（子弹正常飞）
+        for(auto& inf: infos){ fill_inject(inf, aim_pitch, aim_yaw, found); drv.hwbp_enable(&inf); }
 
-        for(auto& inf: infos){ fill_inject(inf, fp, fy, inject); drv.hwbp_enable(&inf); }
-
+        // ★ 三态状态行：一眼看出追踪卡在哪一环
         if(++tick%5==0){
-            if(g_mode==1)
-                printf("\r\033[1;35m[魔数] P=%.0f Y=%.0f        \033[0m", MAGIC_PITCH, MAGIC_YAW);
-            else if(found)
-                printf("\r\033[1;32m[瞄准] 距%.1fm P=%.1f Y=%.1f 反=%s Y偏%.0f P偏%.0f   \033[0m",
+            if(found)
+                printf("\r\033[1;32m[追踪] %.1fm P%.1f Y%.1f 反%s Y%.0f P%.0f        \033[0m",
                        minDist, aim_pitch, aim_yaw, g_yaw_invert?"T":"F", g_yaw_offset, g_pitch_offset);
+            else if(cam_ok)
+                printf("\r\033[1;33m[无目标] 相机OK 但300m内没活人/全死        \033[0m");
             else
-                printf("\r\033[1;31m[未锁定] 按m对照 按q退出   \033[0m");
+                printf("\r\033[1;31m[无相机] 读不到相机位置，检查相机偏移        \033[0m");
             fflush(stdout);
         }
         usleep(10000);
