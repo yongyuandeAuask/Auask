@@ -24,7 +24,7 @@ void* Input(void*){
     char b[32];
     printf("\n\033[1;33m===== 寄存器探针(读敌人坐标试槽位) =====\033[0m\n");
     printf(" a/z=槽±(当前%d)  c/g/m=坐标/角度/魔数(当前%s)\n", g_slot, pname(g_payload));
-    printf(" o=注入开关  p=打印将写的值  q=退出\n", );
+    printf(" o=注入开关  p=打印将写的值  q=退出\n");
     printf(" \033[1;31m用法: 单点射! 一枪一配置! 开枪前按p确认坐标非0\033[0m\n");
     printf("\033[1;33m======================================\033[0m\n");
     while(g_Running){
